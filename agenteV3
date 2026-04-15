@@ -1,0 +1,1102 @@
+"""
+App Tkinter para:
+1. Selecionar um DOCX
+2. Extrair estrutura completa do documento
+3. Gerar JSON estruturado
+4. Visualizar seções, tabelas e quadros
+5. Salvar o JSON
+6. Enviar o JSON para a API do Cogna IA
+
+Dependências:
+    pip install requests python-docx
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+import time
+import traceback
+from pathlib import Path
+import tkinter as tk
+from dataclasses import dataclass, asdict
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import Any, Dict, List, Optional
+
+import requests
+import psycopg2
+from psycopg2.extras import Json
+from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+
+
+APP_TITLE = "Extrator DOCX → JSON + Cogna IA"
+DEFAULT_SSO_URL = "https://sso.platosedu.io/auth/realms/cognaai/protocol/openid-connect/token"
+DEFAULT_CHAT_URL = "https://kroton.platosedu.io/api/service-gen-ia/cogna-ai/generative-ai/v1/chat"
+DEFAULT_CLIENT_ID = "app-client"
+DEFAULT_GRANT_TYPE = "password"
+DEFAULT_ORIGIN = "COGNA_IA_POC_1"
+DEFAULT_AUTH_TIMEOUT = 30
+DEFAULT_REQUEST_TIMEOUT = 240
+
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_NAME = "postgres"
+DB_USER = "postgres"
+DB_PASSWORD = "postgres"
+DB_SCHEMA = "smcogna"
+DB_TABLE = "documentos_estruturados"
+
+
+# =============================================================================
+# MODELOS
+# =============================================================================
+
+@dataclass
+class ParagraphBlock:
+    order: int
+    text: str
+    style: str
+    title_context: str
+    section_context: str
+
+
+@dataclass
+class TableRow:
+    row_index: int
+    values: List[str]
+
+
+@dataclass
+class TableBlock:
+    order: int
+    title_context: str
+    section_context: str
+    headers: List[str]
+    rows: List[TableRow]
+    raw_rows: List[List[str]]
+
+
+@dataclass
+class SectionBlock:
+    title: str
+    level: str
+    paragraphs: List[str]
+
+
+# =============================================================================
+# EXTRAÇÃO E ESTRUTURAÇÃO
+# =============================================================================
+
+def normalize_whitespace(text: str) -> str:
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def is_probable_title(text: str) -> bool:
+    txt = normalize_whitespace(text)
+    txt_low = txt.lower()
+
+    if re.match(r"^(quadro|tabela|figura)\s+\d+", txt_low):
+        return True
+    if re.match(r"^\d+(\.\d+)*\s+", txt):
+        return True
+    if txt.isupper() and len(txt) <= 120:
+        return True
+    return False
+
+
+def guess_section_level(text: str) -> str:
+    txt = normalize_whitespace(text)
+    if re.match(r"^\d+\.\d+\.\d+", txt):
+        return "subsubsecao"
+    if re.match(r"^\d+\.\d+", txt):
+        return "subsecao"
+    if re.match(r"^\d+", txt):
+        return "secao"
+    return "titulo"
+
+
+def iter_block_items(document: Document):
+    from docx.oxml.text.paragraph import CT_P
+    from docx.oxml.table import CT_Tbl
+
+    body = document.element.body
+    for child in body.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, document)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, document)
+
+
+class DocxStructuredExtractor:
+    def extract(self, filepath: str) -> Dict[str, Any]:
+        doc = Document(filepath)
+
+        metadata = self._extract_metadata(filepath, doc)
+        paragraphs: List[ParagraphBlock] = []
+        tables: List[TableBlock] = []
+        sections: List[SectionBlock] = []
+        quadro_map: List[Dict[str, Any]] = []
+
+        current_title = ""
+        current_section = ""
+        paragraph_order = 0
+        table_order = 0
+        current_section_idx: Optional[int] = None
+
+        for block in iter_block_items(doc):
+            if isinstance(block, Paragraph):
+                text = normalize_whitespace(block.text)
+                if not text:
+                    continue
+
+                style_name = getattr(block.style, "name", "") if getattr(block, "style", None) else ""
+
+                if is_probable_title(text):
+                    current_title = text
+                    current_section = text
+
+                    sections.append(
+                        SectionBlock(
+                            title=text,
+                            level=guess_section_level(text),
+                            paragraphs=[],
+                        )
+                    )
+                    current_section_idx = len(sections) - 1
+
+                elif current_section_idx is None:
+                    sections.append(
+                        SectionBlock(
+                            title="Sem seção explícita",
+                            level="livre",
+                            paragraphs=[],
+                        )
+                    )
+                    current_section_idx = len(sections) - 1
+
+                paragraph_order += 1
+                paragraph_block = ParagraphBlock(
+                    order=paragraph_order,
+                    text=text,
+                    style=style_name,
+                    title_context=current_title,
+                    section_context=current_section,
+                )
+                paragraphs.append(paragraph_block)
+                sections[current_section_idx].paragraphs.append(text)
+
+            elif isinstance(block, Table):
+                raw_rows: List[List[str]] = []
+                for row in block.rows:
+                    values = [normalize_whitespace(cell.text) for cell in row.cells]
+                    values = [v for v in values if v]
+                    if values:
+                        raw_rows.append(values)
+
+                if not raw_rows:
+                    continue
+
+                table_order += 1
+
+                headers = raw_rows[0] if len(raw_rows) > 1 else []
+                body_rows = raw_rows[1:] if len(raw_rows) > 1 else raw_rows
+
+                table_rows = [
+                    TableRow(row_index=i + 1, values=row_values)
+                    for i, row_values in enumerate(body_rows)
+                ]
+
+                table_block = TableBlock(
+                    order=table_order,
+                    title_context=current_title,
+                    section_context=current_section,
+                    headers=headers,
+                    rows=table_rows,
+                    raw_rows=raw_rows,
+                )
+                tables.append(table_block)
+
+                if re.match(r"^(quadro|tabela)\s+\d+", current_title.lower()):
+                    quadro_map.append(
+                        {
+                            "titulo": current_title,
+                            "headers": headers,
+                            "itens": self._table_to_items(headers, body_rows),
+                        }
+                    )
+
+        structure = {
+            "documento": metadata,
+            "resumo_estrutura": {
+                "total_paragrafos": len(paragraphs),
+                "total_tabelas": len(tables),
+                "total_secoes": len(sections),
+                "total_quadros_detectados": len(quadro_map),
+            },
+            "secoes": [asdict(s) for s in sections],
+            "paragrafos": [asdict(p) for p in paragraphs],
+            "tabelas": [self._table_block_to_dict(t) for t in tables],
+            "quadros": quadro_map,
+        }
+
+        return structure
+
+    def _extract_metadata(self, filepath: str, doc: Document) -> Dict[str, Any]:
+        core = getattr(doc, "core_properties", None)
+        path = Path(filepath)
+        return {
+            "arquivo": path.name,
+            "caminho": str(path),
+            "extensao": path.suffix.lower(),
+            "titulo": getattr(core, "title", "") if core else "",
+            "autor": getattr(core, "author", "") if core else "",
+            "assunto": getattr(core, "subject", "") if core else "",
+            "categoria": getattr(core, "category", "") if core else "",
+        }
+
+    def _table_block_to_dict(self, table: TableBlock) -> Dict[str, Any]:
+        return {
+            "order": table.order,
+            "title_context": table.title_context,
+            "section_context": table.section_context,
+            "headers": table.headers,
+            "rows": [asdict(r) for r in table.rows],
+            "raw_rows": table.raw_rows,
+        }
+
+    def _normalize_key(self, text: str, idx: int) -> str:
+        text = normalize_whitespace(text).lower()
+        text = re.sub(r"[^\w\s]", "", text)
+        text = re.sub(r"\s+", "_", text).strip("_")
+        return text or f"coluna_{idx}"
+
+    def _table_to_items(self, headers: List[str], rows: List[List[str]]) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+
+        if headers:
+            norm_headers = [self._normalize_key(h, i + 1) for i, h in enumerate(headers)]
+            for row in rows:
+                item: Dict[str, Any] = {}
+                for i, value in enumerate(row):
+                    key = norm_headers[i] if i < len(norm_headers) else f"coluna_{i+1}"
+                    item[key] = value
+                items.append(item)
+        else:
+            for row in rows:
+                items.append({"valores": row})
+
+        return items
+
+
+# =============================================================================
+# APP TKINTER
+# =============================================================================
+
+class DocxJsonApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title(APP_TITLE)
+        self.root.geometry("1500x980")
+
+        self.extractor = DocxStructuredExtractor()
+
+        self.access_token: Optional[str] = None
+        self.selected_file: Optional[str] = None
+        self.current_json: Optional[Dict[str, Any]] = None
+        self._busy = False
+        self._busy_start = 0.0
+        self._timer_job = None
+        self._controls: List[Any] = []
+        self.json_library_dir = str(Path.cwd())
+        self.loaded_json_files: List[Dict[str, Any]] = []
+        self.json_check_vars: Dict[str, tk.BooleanVar] = {}
+        self.current_json_path: Optional[str] = None
+
+        self.db_host = DB_HOST
+        self.db_port = DB_PORT
+        self.db_name = DB_NAME
+        self.db_user = DB_USER
+        self.db_password = DB_PASSWORD
+        self.db_schema = DB_SCHEMA
+        self.db_table = DB_TABLE
+
+        self._build_ui()
+        self.ensure_database_objects()
+        self.reload_json_library()
+
+    # -------------------------------------------------------------------------
+    # UI
+    # -------------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        main = ttk.Frame(self.root)
+        main.pack(fill="both", expand=True)
+
+        notebook = ttk.Notebook(main)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+        self.tab_doc = ttk.Frame(notebook)
+        self.tab_json = ttk.Frame(notebook)
+        self.tab_api = ttk.Frame(notebook)
+        self.tab_log = ttk.Frame(notebook)
+
+        notebook.add(self.tab_doc, text="Documento")
+        notebook.add(self.tab_json, text="JSON")
+        notebook.add(self.tab_api, text="Cogna IA")
+        notebook.add(self.tab_log, text="Log")
+
+        self._build_doc_tab()
+        self._build_json_tab()
+        self._build_api_tab()
+        self._build_log_tab()
+        self._build_status_bar(main)
+
+    def _register_control(self, widget):
+        self._controls.append(widget)
+        return widget
+
+    def _build_doc_tab(self) -> None:
+        frame = ttk.Frame(self.tab_doc, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Arquivo selecionado").grid(row=0, column=0, sticky="w", pady=4)
+        self.file_label_var = tk.StringVar(value="Nenhum arquivo selecionado")
+        ttk.Label(frame, textvariable=self.file_label_var, foreground="blue").grid(row=0, column=1, sticky="w", pady=4)
+
+        info_box = ttk.Labelframe(frame, text="Indicadores")
+        info_box.grid(row=1, column=0, columnspan=2, sticky="ew", pady=8)
+
+        self.extract_status_var = tk.StringVar(value="Extração: não iniciada")
+        self.json_status_var = tk.StringVar(value="JSON: não gerado")
+        self.table_status_var = tk.StringVar(value="Tabelas: 0")
+        self.section_status_var = tk.StringVar(value="Seções: 0")
+
+        ttk.Label(info_box, textvariable=self.extract_status_var).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        ttk.Label(info_box, textvariable=self.json_status_var).grid(row=0, column=1, sticky="w", padx=16, pady=6)
+        ttk.Label(info_box, textvariable=self.table_status_var).grid(row=0, column=2, sticky="w", padx=16, pady=6)
+        ttk.Label(info_box, textvariable=self.section_status_var).grid(row=0, column=3, sticky="w", padx=16, pady=6)
+
+        btns = ttk.Frame(frame)
+        btns.grid(row=2, column=1, sticky="w", pady=8)
+        self._register_control(ttk.Button(btns, text="Selecionar DOCX", command=self.select_docx)).pack(side="left", padx=4)
+        self._register_control(ttk.Button(btns, text="Extrair estrutura", command=self.extract_document)).pack(side="left", padx=4)
+        self._register_control(ttk.Button(btns, text="Salvar JSON", command=self.save_json)).pack(side="left", padx=4)
+        self._register_control(ttk.Button(btns, text="Gerar prompt p/ IA", command=self.generate_prompt_for_ai)).pack(side="left", padx=4)
+
+        split = ttk.Panedwindow(frame, orient=tk.HORIZONTAL)
+        split.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=8)
+
+        left = ttk.Labelframe(split, text="Prévia textual")
+        right = ttk.Labelframe(split, text="Quadros / Tabelas detectados")
+
+        self.preview_txt = scrolledtext.ScrolledText(left, wrap="word")
+        self.preview_txt.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.tables_preview_txt = scrolledtext.ScrolledText(right, wrap="word")
+        self.tables_preview_txt.pack(fill="both", expand=True, padx=6, pady=6)
+
+        split.add(left, weight=1)
+        split.add(right, weight=1)
+
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(3, weight=1)
+
+    def _build_json_tab(self) -> None:
+        frame = ttk.Frame(self.tab_json, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        top = ttk.Frame(frame)
+        top.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(top, text="Consulta rápida no JSON").pack(side="left")
+        self.json_query_var = tk.StringVar(value="Liste todos os títulos de quadros detectados.")
+        ttk.Entry(top, textvariable=self.json_query_var, width=80).pack(side="left", padx=8)
+        self._register_control(ttk.Button(top, text="Gerar prompt JSON", command=self.generate_prompt_for_ai)).pack(side="left")
+
+        self.json_txt = scrolledtext.ScrolledText(frame, wrap="word")
+        self.json_txt.pack(fill="both", expand=True)
+
+    def _build_api_tab(self) -> None:
+        frame = ttk.Frame(self.tab_api, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="SSO URL").grid(row=0, column=0, sticky="w", pady=4)
+        self.sso_url_var = tk.StringVar(value=DEFAULT_SSO_URL)
+        ttk.Entry(frame, textvariable=self.sso_url_var, width=110).grid(row=0, column=1, sticky="ew", pady=4)
+
+        ttk.Label(frame, text="Usuário").grid(row=1, column=0, sticky="w", pady=4)
+        self.username_var = tk.StringVar(value=os.getenv("COGNA_USER", ""))
+        ttk.Entry(frame, textvariable=self.username_var, width=40).grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Senha").grid(row=2, column=0, sticky="w", pady=4)
+        self.password_var = tk.StringVar(value=os.getenv("COGNA_PASS", ""))
+        ttk.Entry(frame, textvariable=self.password_var, width=40, show="*").grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Client ID").grid(row=3, column=0, sticky="w", pady=4)
+        self.client_id_var = tk.StringVar(value=DEFAULT_CLIENT_ID)
+        ttk.Entry(frame, textvariable=self.client_id_var, width=40).grid(row=3, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Grant Type").grid(row=4, column=0, sticky="w", pady=4)
+        self.grant_type_var = tk.StringVar(value=DEFAULT_GRANT_TYPE)
+        ttk.Entry(frame, textvariable=self.grant_type_var, width=40).grid(row=4, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="X-Request-Origin").grid(row=5, column=0, sticky="w", pady=4)
+        self.origin_var = tk.StringVar(value=DEFAULT_ORIGIN)
+        ttk.Entry(frame, textvariable=self.origin_var, width=40).grid(row=5, column=1, sticky="w", pady=4)
+
+        json_box = ttk.Labelframe(frame, text="JSONs disponíveis no banco", padding=8)
+        json_box.grid(row=0, column=2, rowspan=6, sticky="nsew", padx=(20, 0), pady=4)
+
+        json_btns = ttk.Frame(json_box)
+        json_btns.pack(fill="x", pady=(0, 6))
+
+        self._register_control(ttk.Button(json_btns, text="Recarregar", command=self.reload_json_library)).pack(side="left", padx=4)
+        self._register_control(ttk.Button(json_btns, text="Marcar todos", command=self.select_all_jsons)).pack(side="left", padx=4)
+        self._register_control(ttk.Button(json_btns, text="Desmarcar todos", command=self.unselect_all_jsons)).pack(side="left", padx=4)
+        self._register_control(ttk.Button(json_btns, text="Salvar JSON atual", command=self.add_current_json_to_library)).pack(side="left", padx=4)
+
+        self.json_list_canvas = tk.Canvas(json_box, height=180)
+        self.json_list_scroll = ttk.Scrollbar(json_box, orient="vertical", command=self.json_list_canvas.yview)
+        self.json_list_container = ttk.Frame(self.json_list_canvas)
+
+        self.json_list_container.bind(
+            "<Configure>",
+            lambda e: self.json_list_canvas.configure(scrollregion=self.json_list_canvas.bbox("all"))
+        )
+
+        self.json_list_canvas.create_window((0, 0), window=self.json_list_container, anchor="nw")
+        self.json_list_canvas.configure(yscrollcommand=self.json_list_scroll.set)
+
+        self.json_list_canvas.pack(side="left", fill="both", expand=True)
+        self.json_list_scroll.pack(side="right", fill="y")
+
+        self.json_selected_info_var = tk.StringVar(value="Selecionados: 0")
+        ttk.Label(json_box, textvariable=self.json_selected_info_var, foreground="blue").pack(anchor="w", pady=(6, 0))
+
+        ttk.Label(frame, text="Chat URL").grid(row=6, column=0, sticky="w", pady=4)
+        self.chat_url_var = tk.StringVar(value=DEFAULT_CHAT_URL)
+        ttk.Entry(frame, textvariable=self.chat_url_var, width=110).grid(row=6, column=1, sticky="ew", pady=4)
+
+        btns = ttk.Frame(frame)
+        btns.grid(row=7, column=1, sticky="w", pady=8)
+        self._register_control(ttk.Button(btns, text="Autenticar", command=self.authenticate)).pack(side="left", padx=4)
+        self._register_control(ttk.Button(btns, text="Enviar para o Cogna IA", command=self.send_json_to_ai)).pack(side="left", padx=4)
+
+        ttk.Label(frame, text="Prompt para IA").grid(row=8, column=0, sticky="nw", pady=4)
+        self.ai_prompt_txt = scrolledtext.ScrolledText(frame, height=10, wrap="word")
+        self.ai_prompt_txt.grid(row=8, column=1, columnspan=2, sticky="nsew", pady=4)
+        self.ai_prompt_txt.insert(
+            "1.0",
+            "Considere os dados estruturados abaixo e responda com base neles. "
+            "Se houver mais de um JSON selecionado, relacione os arquivos e compare quando fizer sentido."
+        )
+
+        ttk.Label(frame, text="Resposta da IA").grid(row=9, column=0, sticky="nw", pady=4)
+        self.ai_response_txt = scrolledtext.ScrolledText(frame, height=18, wrap="word")
+        self.ai_response_txt.grid(row=9, column=1, columnspan=2, sticky="nsew", pady=4)
+
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(2, weight=1)
+        frame.rowconfigure(9, weight=1)
+
+    def _build_log_tab(self) -> None:
+        frame = ttk.Frame(self.tab_log, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        self._register_control(ttk.Button(frame, text="Limpar log", command=self.clear_log)).pack(anchor="w")
+        self.log_txt = scrolledtext.ScrolledText(frame, wrap="word")
+        self.log_txt.pack(fill="both", expand=True, pady=8)
+
+    def _build_status_bar(self, parent: ttk.Frame) -> None:
+        bar = ttk.Frame(parent, padding=(10, 6))
+        bar.pack(fill="x", side="bottom")
+
+        self.status_var = tk.StringVar(value="Pronto")
+        self.timer_var = tk.StringVar(value="Tempo: 00:00")
+        self.detail_var = tk.StringVar(value="Nenhuma ação em andamento")
+
+        ttk.Label(bar, text="Status:").pack(side="left")
+        ttk.Label(bar, textvariable=self.status_var, foreground="blue").pack(side="left", padx=(4, 20))
+        ttk.Label(bar, textvariable=self.timer_var).pack(side="left", padx=(0, 20))
+        ttk.Label(bar, textvariable=self.detail_var).pack(side="left", padx=(0, 20))
+
+        self.progress = ttk.Progressbar(bar, mode="indeterminate", length=280)
+        self.progress.pack(side="left")
+
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+    def log(self, text: str) -> None:
+        self.log_txt.insert("end", text + "\n")
+        self.log_txt.see("end")
+
+    def clear_log(self) -> None:
+        self.log_txt.delete("1.0", "end")
+
+    def set_text(self, widget: scrolledtext.ScrolledText, value: str) -> None:
+        widget.delete("1.0", "end")
+        widget.insert("1.0", value)
+
+    def run_in_thread(self, fn) -> None:
+        t = threading.Thread(target=fn, daemon=True)
+        t.start()
+
+    def set_controls_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for control in self._controls:
+            try:
+                control.configure(state=state)
+            except Exception:
+                pass
+
+    def start_busy(self, message: str) -> None:
+        self._busy = True
+        self._busy_start = time.time()
+        self.status_var.set(message)
+        self.detail_var.set(message)
+        self.timer_var.set("Tempo: 00:00")
+        self.progress.start(10)
+        self._update_timer()
+        self.set_controls_enabled(False)
+
+    def busy_step(self, message: str) -> None:
+        self.status_var.set(message)
+        self.detail_var.set(message)
+
+    def stop_busy(self, message: str) -> None:
+        self._busy = False
+        self.progress.stop()
+        self.status_var.set(message)
+        self.detail_var.set(message)
+        self.set_controls_enabled(True)
+        if self._timer_job:
+            try:
+                self.root.after_cancel(self._timer_job)
+            except Exception:
+                pass
+            self._timer_job = None
+
+    def _update_timer(self) -> None:
+        if not self._busy:
+            return
+        elapsed = int(time.time() - self._busy_start)
+        mm = elapsed // 60
+        ss = elapsed % 60
+        self.timer_var.set(f"Tempo: {mm:02d}:{ss:02d}")
+        self._timer_job = self.root.after(500, self._update_timer)
+
+    def truncate_text(self, text: str, max_chars: int = 14000) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n\n[... texto truncado ...]"
+
+    # -------------------------------------------------------------------------
+    # Banco de dados / Biblioteca JSON
+    # -------------------------------------------------------------------------
+    def get_db_connection(self):
+        return psycopg2.connect(
+            host=self.db_host,
+            port=self.db_port,
+            dbname=self.db_name,
+            user=self.db_user,
+            password=self.db_password,
+        )
+
+    def ensure_database_objects(self) -> None:
+        try:
+            with self.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.db_schema};")
+                    cur.execute(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS {self.db_schema}.{self.db_table} (
+                            id SERIAL PRIMARY KEY,
+                            nome_arquivo VARCHAR(255) NOT NULL,
+                            titulo_documento VARCHAR(255),
+                            json_conteudo JSONB NOT NULL,
+                            total_secoes INTEGER DEFAULT 0,
+                            total_tabelas INTEGER DEFAULT 0,
+                            total_quadros INTEGER DEFAULT 0,
+                            usuario_nome VARCHAR(150),
+                            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                        """
+                    )
+                conn.commit()
+            self.log("Schema e tabela verificados com sucesso.")
+        except Exception as e:
+            self.log(f"Erro ao criar schema/tabela: {e}")
+            self.log(traceback.format_exc())
+            messagebox.showerror("Erro", f"Falha ao preparar banco de dados\n{e}")
+
+    def reload_json_library(self) -> None:
+        try:
+            self.loaded_json_files.clear()
+            self.json_check_vars.clear()
+
+            for child in self.json_list_container.winfo_children():
+                child.destroy()
+
+            with self.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT
+                            id,
+                            nome_arquivo,
+                            titulo_documento,
+                            total_secoes,
+                            total_tabelas,
+                            total_quadros,
+                            criado_em,
+                            json_conteudo
+                        FROM {self.db_schema}.{self.db_table}
+                        ORDER BY criado_em DESC;
+                        """
+                    )
+                    rows = cur.fetchall()
+
+            for row in rows:
+                record = {
+                    "id": row[0],
+                    "name": row[1],
+                    "title": row[2],
+                    "total_secoes": row[3],
+                    "total_tabelas": row[4],
+                    "total_quadros": row[5],
+                    "criado_em": row[6],
+                    "data": row[7],
+                }
+                self.loaded_json_files.append(record)
+
+            for record in self.loaded_json_files:
+                key = str(record["id"])
+                var = tk.BooleanVar(value=False)
+                self.json_check_vars[key] = var
+
+                text = (
+                    f"{record['id']} - {record['name']} "
+                    f"(seções={record['total_secoes']}, "
+                    f"tabelas={record['total_tabelas']}, "
+                    f"quadros={record['total_quadros']})"
+                )
+
+                chk = ttk.Checkbutton(
+                    self.json_list_container,
+                    text=text,
+                    variable=var,
+                    command=self.update_selected_json_info,
+                )
+                chk.pack(anchor="w", fill="x", padx=4, pady=2)
+
+            self.update_selected_json_info()
+            self.log(f"Biblioteca JSON carregada do banco. Registros: {len(self.loaded_json_files)}")
+
+        except Exception as e:
+            self.log(f"Erro ao carregar registros do banco: {e}")
+            self.log(traceback.format_exc())
+            messagebox.showerror("Erro", f"Falha ao carregar JSONs do banco\n{e}")
+
+    def update_selected_json_info(self) -> None:
+        count = sum(1 for var in self.json_check_vars.values() if var.get())
+        self.json_selected_info_var.set(f"Selecionados: {count}")
+
+    def select_all_jsons(self) -> None:
+        for var in self.json_check_vars.values():
+            var.set(True)
+        self.update_selected_json_info()
+
+    def unselect_all_jsons(self) -> None:
+        for var in self.json_check_vars.values():
+            var.set(False)
+        self.update_selected_json_info()
+
+    def add_current_json_to_library(self) -> None:
+        if not self.current_json:
+            messagebox.showwarning("Aviso", "Nenhum JSON atual foi gerado.")
+            return
+
+        try:
+            documento = self.current_json.get("documento", {})
+            resumo = self.current_json.get("resumo_estrutura", {})
+
+            nome_arquivo = documento.get("arquivo", "documento_sem_nome.json")
+            titulo_documento = documento.get("titulo", "") or nome_arquivo
+
+            with self.get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.db_schema}.{self.db_table} (
+                            nome_arquivo,
+                            titulo_documento,
+                            json_conteudo,
+                            total_secoes,
+                            total_tabelas,
+                            total_quadros,
+                            usuario_nome
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id;
+                        """,
+                        (
+                            nome_arquivo,
+                            titulo_documento,
+                            Json(self.current_json),
+                            resumo.get("total_secoes", 0),
+                            resumo.get("total_tabelas", 0),
+                            resumo.get("total_quadros_detectados", 0),
+                            self.username_var.get().strip() or "postgres",
+                        )
+                    )
+                    new_id = cur.fetchone()[0]
+                conn.commit()
+
+            self.log(f"JSON atual salvo no banco com ID {new_id}.")
+            self.reload_json_library()
+            messagebox.showinfo("Sucesso", f"JSON salvo no banco com ID {new_id}.")
+
+        except Exception as e:
+            self.log(f"Erro ao salvar JSON no banco: {e}")
+            self.log(traceback.format_exc())
+            messagebox.showerror("Erro", f"Falha ao salvar JSON no banco\n{e}")
+
+    def get_selected_json_records(self) -> List[Dict[str, Any]]:
+        selected: List[Dict[str, Any]] = []
+        for record in self.loaded_json_files:
+            key = str(record["id"])
+            var = self.json_check_vars.get(key)
+            if var and var.get():
+                selected.append(record)
+        return selected
+
+    def build_combined_json_context(self) -> tuple[str, List[Dict[str, Any]]]:
+        selected = self.get_selected_json_records()
+
+        if not selected:
+            if self.current_json:
+                payload = {
+                    "modo": "json_atual",
+                    "documentos": [
+                        {
+                            "arquivo": self.current_json.get("documento", {}).get("arquivo", "json_atual"),
+                            "conteudo": self.current_json
+                        }
+                    ]
+                }
+                return json.dumps(payload, indent=2, ensure_ascii=False), []
+            return "", []
+
+        payload = {
+            "modo": "comparativo" if len(selected) > 1 else "individual",
+            "total_documentos": len(selected),
+            "documentos": [],
+        }
+
+        for record in selected:
+            payload["documentos"].append(
+                {
+                    "id": record["id"],
+                    "arquivo": record["name"],
+                    "titulo": record["title"],
+                    "conteudo": record["data"],
+                }
+            )
+
+        return json.dumps(payload, indent=2, ensure_ascii=False), selected
+
+    # -------------------------------------------------------------------------
+    # Documento
+    # -------------------------------------------------------------------------
+    def select_docx(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="Selecione um DOCX",
+            filetypes=[("Arquivos Word", "*.docx"), ("Todos os arquivos", "*.*")]
+        )
+        if not file_path:
+            return
+        self.selected_file = file_path
+        self.file_label_var.set(file_path)
+        self.log(f"Arquivo selecionado: {file_path}")
+
+    def extract_document(self) -> None:
+        def worker():
+            try:
+                if not self.selected_file:
+                    messagebox.showwarning("Aviso", "Selecione um DOCX primeiro.")
+                    return
+
+                self.start_busy("Extraindo documento...")
+                self.busy_step("Lendo DOCX...")
+                structure = self.extractor.extract(self.selected_file)
+
+                self.busy_step("Convertendo estrutura para JSON...")
+                self.current_json = structure
+
+                preview_text = self._build_preview_text(structure)
+                tables_text = self._build_tables_preview(structure)
+                json_text = json.dumps(structure, indent=2, ensure_ascii=False)
+
+                def done():
+                    self.set_text(self.preview_txt, preview_text)
+                    self.set_text(self.tables_preview_txt, tables_text)
+                    self.set_text(self.json_txt, json_text)
+
+                    resumo = structure["resumo_estrutura"]
+                    self.extract_status_var.set("Extração: concluída")
+                    self.json_status_var.set("JSON: gerado")
+                    self.table_status_var.set(f"Tabelas: {resumo['total_tabelas']}")
+                    self.section_status_var.set(f"Seções: {resumo['total_secoes']}")
+
+                    self.stop_busy("Extração concluída")
+
+                self.root.after(0, done)
+                self.log("Documento extraído com sucesso.")
+                self.log(json.dumps(structure["resumo_estrutura"], indent=2, ensure_ascii=False))
+
+            except Exception as e:
+                self.log(f"Erro ao extrair documento: {e}")
+                self.log(traceback.format_exc())
+                self.root.after(0, lambda: self.stop_busy("Erro na extração"))
+                self.root.after(0, lambda: messagebox.showerror("Erro", str(e)))
+
+        self.run_in_thread(worker)
+
+    def _build_preview_text(self, structure: Dict[str, Any]) -> str:
+        lines: List[str] = []
+        lines.append("METADADOS")
+        lines.append(json.dumps(structure["documento"], indent=2, ensure_ascii=False))
+        lines.append("")
+        lines.append("SEÇÕES")
+        for sec in structure["secoes"][:20]:
+            lines.append(f"- {sec['title']} ({sec['level']})")
+            if sec["paragraphs"]:
+                lines.append(f"  {sec['paragraphs'][0][:300]}")
+        return "\n".join(lines)
+
+    def _build_tables_preview(self, structure: Dict[str, Any]) -> str:
+        lines: List[str] = []
+        for idx, quadro in enumerate(structure["quadros"], start=1):
+            lines.append(f"[Quadro {idx}] {quadro['titulo']}")
+            if quadro["headers"]:
+                lines.append("Headers: " + " | ".join(quadro["headers"]))
+            for item in quadro["itens"][:10]:
+                lines.append(json.dumps(item, ensure_ascii=False))
+            lines.append("")
+        if not lines:
+            lines.append("Nenhum quadro/tabela detectado.")
+        return "\n".join(lines)
+
+    def save_json(self) -> None:
+        if not self.current_json:
+            messagebox.showwarning("Aviso", "Extraia um documento primeiro.")
+            return
+
+        out_path = filedialog.asksaveasfilename(
+            title="Salvar JSON",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")]
+        )
+        if not out_path:
+            return
+
+        Path(out_path).write_text(
+            json.dumps(self.current_json, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+        self.log(f"JSON salvo em: {out_path}")
+        messagebox.showinfo("Sucesso", f"JSON salvo em:\n{out_path}")
+
+    def generate_prompt_for_ai(self) -> None:
+        combined_json_text, selected = self.build_combined_json_context()
+
+        if not combined_json_text:
+            messagebox.showwarning("Aviso", "Nenhum JSON disponível. Extraia um documento ou selecione JSONs do banco.")
+            return
+
+        query = self.json_query_var.get().strip() if hasattr(self, "json_query_var") else ""
+        if not query:
+            query = "Liste os principais elementos do documento."
+
+        if len(selected) > 1:
+            instruction = (
+                "Considere os JSONs estruturados abaixo, extraídos automaticamente de vários documentos DOCX.\n\n"
+                f"Pergunta do usuário:\n{query}\n\n"
+                "JSONs selecionados:\n"
+                f"{self.truncate_text(combined_json_text, 25000)}\n\n"
+                "Instruções:\n"
+                "- Responda comparando e relacionando os documentos quando fizer sentido.\n"
+                "- Diga explicitamente quais arquivos foram considerados.\n"
+                "- Destaque semelhanças, diferenças e complementaridades.\n"
+                "- Se houver quadros/tabelas, considere todos os itens presentes.\n"
+                "- Não peça os documentos novamente.\n"
+                "- Seja fiel aos dados."
+            )
+        else:
+            instruction = (
+                "Considere o JSON estruturado abaixo, extraído automaticamente de um documento DOCX.\n\n"
+                f"Pergunta do usuário:\n{query}\n\n"
+                "JSON do documento:\n"
+                f"{self.truncate_text(combined_json_text, 25000)}\n\n"
+                "Instruções:\n"
+                "- Responda com base no JSON.\n"
+                "- Diga explicitamente qual arquivo foi considerado.\n"
+                "- Não peça o documento novamente.\n"
+                "- Se houver quadro/tabela, considere todos os itens presentes.\n"
+                "- Seja fiel aos dados."
+            )
+
+        self.set_text(self.ai_prompt_txt, instruction)
+        self.log("Prompt para IA gerado com base nos JSONs selecionados.")
+
+    # -------------------------------------------------------------------------
+    # API
+    # -------------------------------------------------------------------------
+    def authenticate(self) -> None:
+        def worker():
+            try:
+                self.start_busy("Autenticando...")
+                payload = {
+                    "client_id": self.client_id_var.get().strip(),
+                    "username": self.username_var.get().strip(),
+                    "password": self.password_var.get().strip(),
+                    "grant_type": self.grant_type_var.get().strip(),
+                }
+                headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+                response = requests.post(
+                    self.sso_url_var.get().strip(),
+                    data=payload,
+                    headers=headers,
+                    timeout=DEFAULT_AUTH_TIMEOUT,
+                )
+
+                if response.status_code != 200:
+                    text = response.text
+                    self.log(text)
+                    self.root.after(0, lambda: self.stop_busy("Erro na autenticação"))
+                    self.root.after(0, lambda: messagebox.showerror("Erro", f"Falha na autenticação:\n{text}"))
+                    return
+
+                data = response.json()
+                self.access_token = data.get("access_token")
+                self.log("Autenticação realizada com sucesso.")
+                self.stop_busy("Autenticado")
+
+            except Exception as e:
+                self.log(f"Erro na autenticação: {e}")
+                self.log(traceback.format_exc())
+                self.root.after(0, lambda: self.stop_busy("Erro na autenticação"))
+                self.root.after(0, lambda: messagebox.showerror("Erro", str(e)))
+
+        self.run_in_thread(worker)
+
+    def send_json_to_ai(self) -> None:
+        def worker():
+            try:
+                if not self.access_token:
+                    self.root.after(0, lambda: messagebox.showwarning("Aviso", "Autentique primeiro."))
+                    return
+
+                prompt_usuario = self.ai_prompt_txt.get("1.0", "end").strip()
+                if not prompt_usuario:
+                    self.root.after(0, lambda: messagebox.showwarning("Aviso", "Digite um prompt primeiro."))
+                    return
+
+                combined_json_text, selected = self.build_combined_json_context()
+                if not combined_json_text:
+                    self.root.after(0, lambda: messagebox.showwarning(
+                        "Aviso",
+                        "Extraia um documento ou selecione JSONs do banco antes de enviar."
+                    ))
+                    return
+
+                self.start_busy("Preparando JSON para IA...")
+                self.busy_step("Montando prompt...")
+
+                final_prompt = (
+                    f"{prompt_usuario}\n\n"
+                    "==== JSONS SELECIONADOS ====\n"
+                    f"{self.truncate_text(combined_json_text, 25000)}"
+                )
+
+                payload = {"message": final_prompt}
+
+                headers = {
+                    "Authorization": f"Bearer {self.access_token}",
+                    "Content-Type": "application/json",
+                    "X-Request-Origin": self.origin_var.get().strip(),
+                }
+
+                self.busy_step("Enviando para a IA...")
+                response = requests.post(
+                    self.chat_url_var.get().strip(),
+                    json=payload,
+                    headers=headers,
+                    timeout=DEFAULT_REQUEST_TIMEOUT,
+                )
+
+                text = response.text
+                try:
+                    data = response.json()
+                    pretty = json.dumps(data, indent=2, ensure_ascii=False)
+                    content = self._extract_message_content(data)
+                    output = f"Conteúdo:\n{content}\n\nJSON bruto:\n{pretty}"
+                except Exception:
+                    output = text
+
+                self.root.after(0, lambda: self.set_text(self.ai_response_txt, output))
+                self.log(f"CHAT status: {response.status_code}")
+                self.stop_busy("Resposta recebida")
+
+                if response.status_code != 200:
+                    self.root.after(0, lambda: messagebox.showerror("Erro", output))
+
+            except Exception as e:
+                self.log(f"Erro ao enviar JSON para IA: {e}")
+                self.log(traceback.format_exc())
+                self.root.after(0, lambda: self.stop_busy("Erro no envio"))
+                self.root.after(0, lambda: messagebox.showerror("Erro", str(e)))
+
+        self.run_in_thread(worker)
+
+    def _extract_message_content(self, data: Any) -> str:
+        if isinstance(data, list) and data:
+            item = data[0]
+            if isinstance(item, dict):
+                msg = item.get("message")
+                if isinstance(msg, dict):
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        return content
+
+        if isinstance(data, dict):
+            msg = data.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    return content
+
+        return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+def main() -> None:
+    root = tk.Tk()
+    try:
+        ttk.Style().theme_use("clam")
+    except Exception:
+        pass
+
+    DocxJsonApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
